@@ -1,0 +1,22 @@
+{
+  "name": "stickerly",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon"
+  },
+  "dependencies": {
+    "axios": "latest",
+    "baileys": "github:itsliaaa/baileys",
+    "file-type": "*",
+    "sharp": "latest",
+    "fluent-ffmpeg": "latest",
+    "node-webpmux": "latest",
+    "pino": "latest"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
