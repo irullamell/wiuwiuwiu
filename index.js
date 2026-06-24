@@ -505,26 +505,37 @@ function getMessageText(msg) {
   );
 }
 
-async function downloadBuffer(url, retries = 2) {
+async function downloadBuffer(url, retries = 5) {
+  let lastErr;
   for (let i = 0; i < retries; i++) {
     try {
       const res = await axios.get(url, {
-        responseType: "arraybuffer", timeout: 15000,
+        responseType: "arraybuffer",
+        timeout: 30000,
         headers: {
-          "user-agent": "androidapp.stickerly/3.17.0 (Redmi Note 4; U; Android 29; in-ID; id;)",
-          "accept-encoding": "gzip, deflate, br", "connection": "keep-alive"
+          "user-agent": "Mozilla/5.0 (Linux; Android 10; Redmi Note 4) AppleWebKit/537.36",
+          "accept": "image/webp,image/png,image/*,*/*",
+          "accept-encoding": "gzip, deflate, br",
+          "connection": "keep-alive"
         },
-        maxRedirects: 5, decompress: true
+        maxRedirects: 5,
+        decompress: true
       });
       const buffer = Buffer.from(res.data);
-      if (buffer.toString().includes("error") || buffer.toString().includes("404"))
-        throw new Error("Server error response");
+      if (buffer.length < 100) throw new Error("Buffer too small");
       return buffer;
     } catch (err) {
-      if (i === retries - 1) throw err;
-      await new Promise(r => setTimeout(r, 200 * (i + 1)));
+      lastErr = err;
+      const isRetryable = err.code === "ECONNRESET" || err.code === "ETIMEDOUT" ||
+        err.code === "ECONNABORTED" || err.code === "EPIPE" ||
+        (err.response && err.response.status >= 500);
+      if (!isRetryable || i === retries - 1) throw err;
+      const delay = Math.min(500 * Math.pow(2, i), 8000);
+      logStacked("warn", "DL", `Retry ${i+1}/${retries} (${err.code || err.message}) wait ${delay}ms`);
+      await new Promise(r => setTimeout(r, delay));
     }
   }
+  throw lastErr;
 }
 
 async function react(sock, jid, msg, emoji) {
