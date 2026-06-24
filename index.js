@@ -18,7 +18,6 @@ import { makeWASocket, useMultiFileAuthState, generateWAMessageFromContent, prep
 import pino from "pino";
 import readline from "readline";
 import fs from "fs";
-import axios from "axios";
 import path from "path";
 import sharp from "sharp";
 import { fileURLToPath } from "url";
@@ -47,7 +46,8 @@ const log = {
   banner: (msg)      => console.log(`${C.bgMagenta}${C.white}${C.bold}${msg}${C.reset}`)
 };
 
-const _logStack = new Map();
+// ─── Stacked / rate-limited log untuk mencegah spam ──────────────────────────
+const _logStack = new Map(); // key → { msg, count, timer }
 function logStacked(level, tag, msg, delayMs = 1000) {
   const key = `${level}|${tag}|${msg}`;
   if (_logStack.has(key)) {
@@ -74,7 +74,6 @@ const CPU_COUNT         = os.cpus().length;
 const TOTAL_MEMORY      = os.totalmem();
 const DB_FILE           = path.join(__dirname, "database.json");
 const MAX_PACK_STICKERS = 60;
-const OMEGATECH_BASE    = "https://omegatech-api.dixonomega.tech/api/tools/Sticker";
 
 function getAdaptiveConcurrency() {
   const freeMB  = os.freemem() / 1024 / 1024;
@@ -93,16 +92,11 @@ sharp.cache({ memory: 50, files: 0, items: 50 });
 sharp.concurrency(Math.max(1, Math.floor(CPU_COUNT / 2)));
 sharp.simd(true);
 
-axios.defaults.timeout = 30000;
-axios.defaults.maxContentLength = 100 * 1024 * 1024;
-axios.defaults.maxBodyLength    = 100 * 1024 * 1024;
-axios.defaults.httpAgent  = new (await import('http')).Agent({ keepAlive: true, maxSockets: MAX_CONCURRENT_DOWNLOADS, maxFreeSockets: CPU_COUNT });
-axios.defaults.httpsAgent = new (await import('https')).Agent({ keepAlive: true, maxSockets: MAX_CONCURRENT_DOWNLOADS, maxFreeSockets: CPU_COUNT });
-
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 const maxMemMB = Math.floor((TOTAL_MEMORY / 1024 / 1024) * 0.75);
 
+// ─── Startup banner (satu kali, ringkas) ─────────────────────────────────────
 log.banner(` DENJI STICKER BOT `);
 log.perf("INIT",
   `CPU: ${CPU_COUNT} cores | ` +
@@ -117,6 +111,7 @@ log.perf("INIT",
   `Batch: ${BATCH_SIZE}`
 );
 
+// ─── SWGC pending sessions ────────────────────────────────────────────────────
 const swgcPendingSessions = new Map();
 
 class Semaphore {
@@ -154,6 +149,7 @@ const downloadSemaphore   = new Semaphore(MAX_CONCURRENT_DOWNLOADS,   DL_MEM_THR
 const conversionSemaphore = new Semaphore(MAX_CONCURRENT_CONVERSIONS, CONV_MEM_THRESHOLD);
 const uploadSemaphore     = new Semaphore(MAX_CONCURRENT_UPLOADS,     UP_MEM_THRESHOLD);
 
+// ─── Memory pressure: throttle sekali per 10 detik ───────────────────────────
 let _lastMemWarn = 0;
 async function checkMemoryPressure() {
   const freeMB = os.freemem() / 1024 / 1024;
@@ -505,37 +501,37 @@ function getMessageText(msg) {
   );
 }
 
-async function downloadBuffer(url, retries = 5) {
-  let lastErr;
+async function downloadBuffer(url, retries = 2) {
   for (let i = 0; i < retries; i++) {
     try {
-      const res = await axios.get(url, {
-        responseType: "arraybuffer",
-        timeout: 30000,
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+
+      const res = await fetch(url, {
+        signal: controller.signal,
         headers: {
-          "user-agent": "Mozilla/5.0 (Linux; Android 10; Redmi Note 4) AppleWebKit/537.36",
-          "accept": "image/webp,image/png,image/*,*/*",
+          "user-agent": "androidapp.stickerly/3.17.0 (Redmi Note 4; U; Android 29; in-ID; id;)",
           "accept-encoding": "gzip, deflate, br",
           "connection": "keep-alive"
-        },
-        maxRedirects: 5,
-        decompress: true
+        }
       });
-      const buffer = Buffer.from(res.data);
-      if (buffer.length < 100) throw new Error("Buffer too small");
+
+      clearTimeout(timeout);
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const arrayBuffer = await res.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      if (buffer.toString().includes("error") || buffer.toString().includes("404"))
+        throw new Error("Server error response");
+
       return buffer;
     } catch (err) {
-      lastErr = err;
-      const isRetryable = err.code === "ECONNRESET" || err.code === "ETIMEDOUT" ||
-        err.code === "ECONNABORTED" || err.code === "EPIPE" ||
-        (err.response && err.response.status >= 500);
-      if (!isRetryable || i === retries - 1) throw err;
-      const delay = Math.min(500 * Math.pow(2, i), 8000);
-      logStacked("warn", "DL", `Retry ${i+1}/${retries} (${err.code || err.message}) wait ${delay}ms`);
-      await new Promise(r => setTimeout(r, delay));
+      if (i === retries - 1) throw err;
+      await new Promise(r => setTimeout(r, 200 * (i + 1)));
     }
   }
-  throw lastErr;
 }
 
 async function react(sock, jid, msg, emoji) {
@@ -570,39 +566,63 @@ class ProgressTracker {
   }
 }
 
-// ─── StickerLy via Omegatech API ──────────────────────────────────────────────
-class StickerLy {
-  detail = async (url) => {
-    const { data } = await axios.get(OMEGATECH_BASE, {
-      params: { action: "pack", id: url, needRelation: true },
-      timeout: 20000
-    });
-
-    if (!data.success) throw new Error("Omegatech API error: " + (data.message || "unknown"));
-
-    const result = data.data.result;
-    const prefix = result.resourceUrlPrefix;
-
-    return {
-      name: result.name,
-      author: {
-        name: result.user?.displayName || result.authorName,
-        username: result.authorName
-      },
-      stickers: result.stickers.map(s => ({
-        fileName: s.fileName,
-        isAnimated: s.isAnimated || s.animated || false,
-        imageUrl: `${prefix}${s.fileName}`
-      })),
-      stickerCount: result.stickers.length,
-      viewCount: result.viewCount,
-      exportCount: result.exportCount,
-      isPaid: result.isPaid,
-      isAnimated: result.isAnimated || result.animated || false,
-      trayIndex: result.trayIndex ?? 0,
-      url: result.shareUrl
-    };
+class StickerAPI {
+  #apiBase = "http://fr2.spaceify.eu:25305";
+  #headers = {
+    "user-agent": "androidapp.stickerly/3.17.0 (Redmi Note 4; U; Android 29; in-ID; id;)",
+    "accept-encoding": "gzip, deflate, br",
+    "connection": "keep-alive"
   };
+
+  async detail(url) {
+    if (!url) throw new Error("URL required");
+    
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+
+      const res = await fetch(
+        `${this.#apiBase}/?url=${encodeURIComponent(url)}`,
+        { 
+          headers: this.#headers, 
+          signal: controller.signal 
+        }
+      );
+
+      clearTimeout(timeout);
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const data = await res.json();
+
+      if (!data.status || !data.data) throw new Error("Invalid API response");
+
+      const packData = data.data;
+      return {
+        name: packData.name,
+        author: {
+          name: packData.author?.name || "Unknown",
+          username: packData.author?.username || "unknown",
+          avatar: packData.author?.avatar || null
+        },
+        stickers: packData.stickers.map(s => ({
+          fileName: s.fileName,
+          isAnimated: s.isAnimated,
+          imageUrl: s.imageUrl
+        })),
+        stickerCount: packData.stickerCount,
+        viewCount: packData.viewCount,
+        exportCount: packData.exportCount,
+        isPaid: packData.isPaid,
+        isAnimated: packData.isAnimated,
+        trayIndex: 0,
+        url: packData.url,
+        thumbnailUrl: packData.thumbnailUrl
+      };
+    } catch (err) {
+      throw new Error(`Failed to fetch pack details: ${err.message}`);
+    }
+  }
 }
 
 async function processInChunks(items, chunkSize, processor) {
@@ -1170,7 +1190,7 @@ async function handleLinkInput(sock, msg, jid, msgText) {
   const urls = extractUrls(msgText);
   if (!urls.length) return;
 
-  const sly = new StickerLy();
+  const api = new StickerAPI();
   await react(sock, jid, msg, "⏳");
 
   let addedTotal = 0;
@@ -1178,7 +1198,7 @@ async function handleLinkInput(sock, msg, jid, msgText) {
 
   for (const url of urls) {
     try {
-      const detail = await sly.detail(url);
+      const detail = await api.detail(url);
       if (!session.packName)  session.packName  = detail.name;
       if (!session.firstUrl)  session.firstUrl  = detail.url;
       session.stickers.push(...detail.stickers);
@@ -1309,7 +1329,7 @@ async function handleSetWm(sock, msg, jid, raw) {
 }
 
 async function handleStickerLy(sock, msg, text, jid) {
-  const sly = new StickerLy();
+  const api = new StickerAPI();
   if (!text) { await react(sock, jid, msg, "?"); return; }
 
   const lowerText = text.toLowerCase();
@@ -1318,12 +1338,22 @@ async function handleStickerLy(sock, msg, text, jid) {
     return;
   }
 
+  if (lowerText.startsWith("cari ")) {
+    await sock.sendMessage(jid, {
+      text: `Fitur pencarian tidak tersedia.\n\nGunakan URL sticker.ly langsung:\n.sly <url>\n\nAtau gunakan mode input untuk menggabungkan banyak pack:\n.sly --input`
+    }, { quoted: msg });
+    return;
+  }
+
   const urlMatch = text.match(/https?:\/\/[^\s]+/);
-  if (!urlMatch) { await react(sock, jid, msg, "?"); return; }
+  if (!urlMatch) { 
+    await react(sock, jid, msg, "?"); 
+    return; 
+  }
 
   const { isPremium, isAntiSteal } = parseFlags(text);
   try {
-    const detail = await sly.detail(urlMatch[0]);
+    const detail = await api.detail(urlMatch[0]);
     await sendStickerPack(sock, jid, detail, msg, isPremium, isAntiSteal);
   } catch (err) {
     log.error("SLY", err.message);
@@ -1447,6 +1477,7 @@ async function handleStickerLy(sock, msg, text, jid) {
     }
   });
 
+  // ─── Periodic GC (silent, hanya log sekali per siklus) ───────────────────────
   if (global.gc) {
     setInterval(() => {
       bufferPool.clear();
