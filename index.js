@@ -561,33 +561,6 @@ class ProgressTracker {
 
 // ─── StickerLy via Omegatech API ──────────────────────────────────────────────
 class StickerLy {
-  search = async (query) => {
-    if (!query) throw new Error("Query required");
-    // Omegatech belum punya endpoint search, fallback ke stickerly langsung
-    const { data } = await axios.post(
-      "https://api.sticker.ly/v4/stickerPack/smartSearch",
-      {
-        keyword: query, enabledKeywordSearch: true,
-        filter: { extendSearchResult:false, sortBy:"RECOMMENDED", languages:["ALL"], minStickerCount:5, searchBy:"ALL", stickerType:"ALL" }
-      },
-      {
-        headers: {
-          "user-agent": "androidapp.stickerly/3.17.0 (Redmi Note 4; U; Android 29; in-ID; id;)",
-          "content-type": "application/json",
-          "accept-encoding": "gzip, deflate, br",
-          "connection": "keep-alive"
-        },
-        timeout: 15000
-      }
-    );
-    return data.result.stickerPacks.map(pack => ({
-      name: pack.name, author: pack.authorName,
-      stickerCount: pack.resourceFiles?.length || pack.stickerCount,
-      viewCount: pack.viewCount, exportCount: pack.exportCount,
-      isPaid: pack.isPaid, isAnimated: pack.isAnimated, url: pack.shareUrl
-    }));
-  };
-
   detail = async (url) => {
     const { data } = await axios.get(OMEGATECH_BASE, {
       params: { action: "pack", id: url, needRelation: true },
@@ -1331,34 +1304,6 @@ async function handleStickerLy(sock, msg, text, jid) {
   const lowerText = text.toLowerCase();
   if (lowerText.startsWith("--input") || lowerText === "input") {
     await handleStartInputSession(sock, msg, jid, text);
-    return;
-  }
-
-  if (lowerText.startsWith("cari ")) {
-    const query = text.slice(5).trim();
-    if (!query) { await react(sock, jid, msg, "?"); return; }
-    try {
-      const results = await sly.search(query);
-      if (!results?.length) { await react(sock, jid, msg, "x"); return; }
-
-      let resultText = `Search: "${query}" (${results.length} packs)\n\n`;
-      results.slice(0, 5).forEach((pack, i) => {
-        resultText +=
-          `${i+1}. ${pack.name}\n` +
-          `Author: ${pack.author} | ${pack.stickerCount} stickers\n` +
-          `${pack.isAnimated?"Animated":"Static"} | ${pack.isPaid?"Paid":"Free"}\n` +
-          `${pack.url}\n\n`;
-      });
-      resultText +=
-        `Usage:\n` +
-        `- .sly <url>                 → Normal pack\n` +
-        `- .sly <url> --prem          → Premium badge\n` +
-        `- .sly <url> --antisteal     → Avatar/AI metadata\n` +
-        `- .sly <url> --prem --antisteal → Both\n` +
-        `- .sly --input               → Gabungkan banyak link (maks ${MAX_PACK_STICKERS}/pack)`;
-
-      return sock.sendMessage(jid, { text: resultText }, { quoted: msg });
-    } catch { await react(sock, jid, msg, "x"); }
     return;
   }
 
