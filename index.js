@@ -26,6 +26,8 @@ import { tmpdir } from "os";
 import Crypto from "crypto";
 import ff from "fluent-ffmpeg";
 import webp from "node-webpmux";
+import http from "http";
+import https from "https";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -47,8 +49,7 @@ const log = {
   banner: (msg)      => console.log(`${C.bgMagenta}${C.white}${C.bold}${msg}${C.reset}`)
 };
 
-// ─── Stacked / rate-limited log untuk mencegah spam ──────────────────────────
-const _logStack = new Map(); // key → { msg, count, timer }
+const _logStack = new Map();
 function logStacked(level, tag, msg, delayMs = 1000) {
   const key = `${level}|${tag}|${msg}`;
   if (_logStack.has(key)) {
@@ -93,17 +94,34 @@ sharp.cache({ memory: 50, files: 0, items: 50 });
 sharp.concurrency(Math.max(1, Math.floor(CPU_COUNT / 2)));
 sharp.simd(true);
 
-axios.defaults.timeout = 30000;
-axios.defaults.maxContentLength = 100 * 1024 * 1024;
-axios.defaults.maxBodyLength    = 100 * 1024 * 1024;
-axios.defaults.httpAgent  = new (await import('http')).Agent({ keepAlive: true, maxSockets: MAX_CONCURRENT_DOWNLOADS, maxFreeSockets: CPU_COUNT });
-axios.defaults.httpsAgent = new (await import('https')).Agent({ keepAlive: true, maxSockets: MAX_CONCURRENT_DOWNLOADS, maxFreeSockets: CPU_COUNT });
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 10000,
+  maxSockets: MAX_CONCURRENT_DOWNLOADS,
+  maxFreeSockets: Math.max(4, Math.floor(MAX_CONCURRENT_DOWNLOADS / 2)),
+  timeout: 30000,
+  scheduling: "lifo"
+});
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 10000,
+  maxSockets: MAX_CONCURRENT_DOWNLOADS,
+  maxFreeSockets: Math.max(4, Math.floor(MAX_CONCURRENT_DOWNLOADS / 2)),
+  timeout: 30000,
+  scheduling: "lifo"
+});
+
+axios.defaults.timeout           = 30000;
+axios.defaults.maxContentLength  = 100 * 1024 * 1024;
+axios.defaults.maxBodyLength     = 100 * 1024 * 1024;
+axios.defaults.httpAgent         = httpAgent;
+axios.defaults.httpsAgent        = httpsAgent;
 
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 const maxMemMB = Math.floor((TOTAL_MEMORY / 1024 / 1024) * 0.75);
 
-// ─── Startup banner (satu kali, ringkas) ─────────────────────────────────────
 log.banner(` DENJI STICKER BOT `);
 log.perf("INIT",
   `CPU: ${CPU_COUNT} cores | ` +
@@ -118,8 +136,67 @@ log.perf("INIT",
   `Batch: ${BATCH_SIZE}`
 );
 
-// ─── SWGC pending sessions ────────────────────────────────────────────────────
 const swgcPendingSessions = new Map();
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function isRetryableError(err) {
+  if (!err) return false;
+  const code = err.code || err.cause?.code || "";
+  const msg  = (err.message || "").toLowerCase();
+  return (
+    code === "ECONNRESET"      ||
+    code === "ECONNREFUSED"    ||
+    code === "ETIMEDOUT"       ||
+    code === "ENOTFOUND"       ||
+    code === "EPIPE"           ||
+    code === "EHOSTUNREACH"    ||
+    code === "EAI_AGAIN"       ||
+    msg.includes("econnreset") ||
+    msg.includes("socket hang up") ||
+    msg.includes("network error")  ||
+    msg.includes("timeout")        ||
+    (err.response?.status >= 500 && err.response?.status < 600) ||
+    err.response?.status === 429
+  );
+}
+
+class CircuitBreaker {
+  constructor(threshold = 5, cooldownMs = 15000) {
+    this.threshold  = threshold;
+    this.cooldownMs = cooldownMs;
+    this.failures   = 0;
+    this.lastFail   = 0;
+    this.open       = false;
+  }
+
+  record(success) {
+    if (success) {
+      this.failures = Math.max(0, this.failures - 1);
+      if (this.open && this.failures === 0) {
+        this.open = false;
+        log.ok("CB", "Circuit closed");
+      }
+    } else {
+      this.failures++;
+      this.lastFail = Date.now();
+      if (this.failures >= this.threshold) {
+        if (!this.open) log.warn("CB", "Circuit OPEN - throttling downloads");
+        this.open = true;
+      }
+    }
+  }
+
+  async gate() {
+    if (!this.open) return;
+    const wait = this.cooldownMs - (Date.now() - this.lastFail);
+    if (wait > 0) await sleep(wait);
+    this.open     = false;
+    this.failures = Math.floor(this.failures / 2);
+  }
+}
+
+const stickerlyCircuit = new CircuitBreaker(8, 20000);
 
 class Semaphore {
   constructor(max, memThresholdMB = 200) {
@@ -156,7 +233,6 @@ const downloadSemaphore   = new Semaphore(MAX_CONCURRENT_DOWNLOADS,   DL_MEM_THR
 const conversionSemaphore = new Semaphore(MAX_CONCURRENT_CONVERSIONS, CONV_MEM_THRESHOLD);
 const uploadSemaphore     = new Semaphore(MAX_CONCURRENT_UPLOADS,     UP_MEM_THRESHOLD);
 
-// ─── Memory pressure: throttle sekali per 10 detik ───────────────────────────
 let _lastMemWarn = 0;
 async function checkMemoryPressure() {
   const freeMB = os.freemem() / 1024 / 1024;
@@ -191,7 +267,6 @@ class BufferPool {
 
 const bufferPool = new BufferPool(20, 1 * 1024 * 1024);
 
-// ─── Database ──────────────────────────────────────────────────────────────────
 function loadDB() {
   try {
     if (!fs.existsSync(DB_FILE)) return { sessions: {}, settings: {} };
@@ -217,7 +292,6 @@ function getPackName()          { return getSettings().packName || PACK_NAME; }
 function getAuthor()            { return getSettings().author  || AUTHOR; }
 function saveSettings(partial)  { global.__db.settings = { ...getSettings(), ...partial }; saveDB(global.__db); }
 
-// ─── EXIF / WebP helpers ───────────────────────────────────────────────────────
 function buildExif(packname, author, categories = [""], isPremium = false, isAntiSteal = false) {
   const json = {
     "sticker-pack-id": (isPremium || isAntiSteal)
@@ -508,26 +582,72 @@ function getMessageText(msg) {
   );
 }
 
-async function downloadBuffer(url, retries = 2) {
-  for (let i = 0; i < retries; i++) {
+async function downloadBuffer(url, retries = 4, baseDelayMs = 300) {
+  let lastErr;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) {
+      const delay  = baseDelayMs * (3 ** (attempt - 1));
+      const jitter = delay * 0.2 * (Math.random() * 2 - 1);
+      await sleep(Math.min(delay + jitter, 8000));
+    }
+
     try {
+      const controller = new AbortController();
+      const timer      = setTimeout(() => controller.abort(), 20000);
+
       const res = await axios.get(url, {
-        responseType: "arraybuffer", timeout: 15000,
+        responseType: "arraybuffer",
+        timeout:      20000,
+        signal:       controller.signal,
+        httpAgent,
+        httpsAgent,
         headers: {
-          "user-agent": "androidapp.stickerly/3.17.0 (Redmi Note 4; U; Android 29; in-ID; id;)",
-          "accept-encoding": "gzip, deflate, br", "connection": "keep-alive"
+          "user-agent":      "androidapp.stickerly/3.17.0 (Redmi Note 4; U; Android 29; in-ID; id;)",
+          "accept":          "image/webp,image/*,*/*;q=0.8",
+          "accept-encoding": "gzip, deflate, br",
+          "connection":      "keep-alive",
+          "cache-control":   "no-cache"
         },
-        maxRedirects: 5, decompress: true
+        maxRedirects:   5,
+        decompress:     true,
+        validateStatus: (s) => s < 400
       });
+
+      clearTimeout(timer);
+
       const buffer = Buffer.from(res.data);
-      if (buffer.toString().includes("error") || buffer.toString().includes("404"))
-        throw new Error("Server error response");
+
+      if (buffer.length < 50) {
+        throw new Error(`Response too small (${buffer.length} bytes)`);
+      }
+
+      const preview = buffer.toString("utf-8", 0, Math.min(200, buffer.length));
+      if (preview.includes('"error"') && preview.includes('"status"')) {
+        throw new Error("Server returned error JSON");
+      }
+
       return buffer;
+
     } catch (err) {
-      if (i === retries - 1) throw err;
-      await new Promise(r => setTimeout(r, 200 * (i + 1)));
+      lastErr = err;
+
+      if (!isRetryableError(err) && attempt === 0) {
+        logStacked("warn", "DL", `Non-retryable: ${err.code || err.message} -> ${url.slice(-40)}`);
+        throw err;
+      }
+
+      if (attempt < retries) {
+        logStacked("warn", "DL",
+          `Attempt ${attempt + 1}/${retries + 1} failed ` +
+          `[${err.code || err.response?.status || err.message}] ` +
+          `-> retry... ${url.slice(-40)}`
+        );
+      }
     }
   }
+
+  throw new Error(`Download failed after ${retries + 1} attempts: ${lastErr?.message}`);
 }
 
 async function react(sock, jid, msg, emoji) {
@@ -564,48 +684,87 @@ class ProgressTracker {
 
 class StickerLy {
   #headers = {
-    "user-agent": "androidapp.stickerly/3.17.0 (Redmi Note 4; U; Android 29; in-ID; id;)",
-    "content-type": "application/json",
+    "user-agent":      "androidapp.stickerly/3.17.0 (Redmi Note 4; U; Android 29; in-ID; id;)",
+    "content-type":    "application/json",
+    "accept":          "application/json",
     "accept-encoding": "gzip, deflate, br",
-    "connection": "keep-alive"
+    "connection":      "keep-alive"
+  };
+
+  #apiRequest = async (fn, retries = 3) => {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (attempt > 0) {
+        const delay = 500 * (2 ** (attempt - 1));
+        await sleep(delay + Math.random() * 200);
+      }
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        if (!isRetryableError(err)) throw err;
+        if (attempt < retries) {
+          logStacked("warn", "API",
+            `Retry ${attempt + 1}/${retries} [${err.code || err.response?.status || err.message}]`
+          );
+        }
+      }
+    }
+    throw lastErr;
   };
 
   search = async (query) => {
     if (!query) throw new Error("Query required");
-    const { data } = await axios.post(
-      "https://api.sticker.ly/v4/stickerPack/smartSearch",
-      {
-        keyword: query, enabledKeywordSearch: true,
-        filter: { extendSearchResult:false, sortBy:"RECOMMENDED", languages:["ALL"], minStickerCount:5, searchBy:"ALL", stickerType:"ALL" }
-      },
-      { headers: this.#headers, timeout: 15000 }
-    );
-    return data.result.stickerPacks.map(pack => ({
-      name: pack.name, author: pack.authorName, stickerCount: pack.resourceFiles.length,
-      viewCount: pack.viewCount, exportCount: pack.exportCount,
-      isPaid: pack.isPaid, isAnimated: pack.isAnimated, url: pack.shareUrl
-    }));
+    return this.#apiRequest(async () => {
+      const { data } = await axios.post(
+        "https://api.sticker.ly/v4/stickerPack/smartSearch",
+        {
+          keyword: query, enabledKeywordSearch: true,
+          filter: {
+            extendSearchResult: false, sortBy: "RECOMMENDED",
+            languages: ["ALL"], minStickerCount: 5,
+            searchBy: "ALL", stickerType: "ALL"
+          }
+        },
+        { headers: this.#headers, timeout: 15000, httpsAgent }
+      );
+      return data.result.stickerPacks.map(pack => ({
+        name: pack.name, author: pack.authorName,
+        stickerCount: pack.resourceFiles.length,
+        viewCount: pack.viewCount, exportCount: pack.exportCount,
+        isPaid: pack.isPaid, isAnimated: pack.isAnimated, url: pack.shareUrl
+      }));
+    });
   };
 
   detail = async (url) => {
     const match = url.match(/\/s\/([^\/\?#]+)/);
     if (!match) throw new Error("Invalid URL");
-    const { data } = await axios.get(
-      `https://api.sticker.ly/v4/stickerPack/${match[1]}?needRelation=true`,
-      { headers: this.#headers, timeout: 15000 }
-    );
-    return {
-      name: data.result.name,
-      author: { name: data.result.user.displayName, username: data.result.user.userName },
-      stickers: data.result.stickers.map(s => ({
-        fileName: s.fileName, isAnimated: s.isAnimated,
-        imageUrl: `${data.result.resourceUrlPrefix}${s.fileName}`
-      })),
-      stickerCount: data.result.stickers.length,
-      viewCount: data.result.viewCount, exportCount: data.result.exportCount,
-      isPaid: data.result.isPaid, isAnimated: data.result.isAnimated,
-      trayIndex: data.result.trayIndex, url: data.result.shareUrl
-    };
+    return this.#apiRequest(async () => {
+      const { data } = await axios.get(
+        `https://api.sticker.ly/v4/stickerPack/${match[1]}?needRelation=true`,
+        { headers: this.#headers, timeout: 15000, httpsAgent }
+      );
+      return {
+        name:   data.result.name,
+        author: {
+          name:     data.result.user.displayName,
+          username: data.result.user.userName
+        },
+        stickers: data.result.stickers.map(s => ({
+          fileName:   s.fileName,
+          isAnimated: s.isAnimated,
+          imageUrl:   `${data.result.resourceUrlPrefix}${s.fileName}`
+        })),
+        stickerCount: data.result.stickers.length,
+        viewCount:    data.result.viewCount,
+        exportCount:  data.result.exportCount,
+        isPaid:       data.result.isPaid,
+        isAnimated:   data.result.isAnimated,
+        trayIndex:    data.result.trayIndex,
+        url:          data.result.shareUrl
+      };
+    });
   };
 }
 
@@ -631,18 +790,21 @@ async function sendStickerPack(sock, jid, detail, msg, isPremium=false, isAntiSt
   const flags = [isPremium && "Premium", isAntiSteal && "Anti-Steal"].filter(Boolean).join(", ");
   log.info("PACK", `"${detail.name}" | ${stickers.length} stickers${flags ? ` | ${flags}` : ""}`);
 
-  // ── Phase 1: Download ────────────────────────────────────────────────────────
   const downloadProgress = new ProgressTracker(stickers.length, "DOWNLOAD");
   let dlFail = 0;
 
   const downloadTasks = stickers.map((s, i) => async () => {
+    await stickerlyCircuit.gate();
     try {
       const buffer = await downloadSemaphore.use(() => downloadBuffer(s.imageUrl));
+      stickerlyCircuit.record(true);
       downloadProgress.increment();
       return { index: i, buffer, isAnimated: s.isAnimated };
     } catch (err) {
+      stickerlyCircuit.record(false);
       dlFail++;
       downloadProgress.increment();
+      logStacked("warn", "DL", `[${i}] ${err.message?.slice(0, 60)}`);
       return null;
     }
   });
@@ -653,7 +815,6 @@ async function sendStickerPack(sock, jid, detail, msg, isPremium=false, isAntiSt
   log.ok("PACK", `DL: ${downloadedData.length}/${stickers.length}${dlFail ? ` (${dlFail} failed)` : ""}`);
   if (downloadedData.length === 0) throw new Error("No stickers downloaded");
 
-  // ── Phase 2: Convert ─────────────────────────────────────────────────────────
   const convertProgress = new ProgressTracker(downloadedData.length, "CONVERT");
   let convFail = 0;
 
@@ -682,11 +843,9 @@ async function sendStickerPack(sock, jid, detail, msg, isPremium=false, isAntiSt
   downloadedData.length = 0;
   if (global.gc) global.gc();
 
-  // ── Phase 3: Cover ───────────────────────────────────────────────────────────
   const coverIdx        = (trayIndex != null && stickerData[trayIndex]) ? trayIndex : 0;
   const coverJpegBuffer = await buildEmbeddedCover(stickerData[coverIdx].buffer);
 
-  // ── Phase 4: Send ────────────────────────────────────────────────────────────
   const totalBatch = Math.ceil(stickerData.length / BATCH_SIZE);
   const sendProgress = new ProgressTracker(totalBatch, "SEND");
   let successSEND = 0;
@@ -762,8 +921,6 @@ function chunkArray(arr, size) {
   for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
   return chunks;
 }
-
-// ─── SWGC HELPERS ─────────────────────────────────────────────────────────────
 
 function getQuotedMedia(msg) {
   const m = msg.message;
@@ -865,19 +1022,19 @@ async function sendGroupList(sock, senderJid, msg, swgcPayload) {
 
   if (groups.length === 0) {
     await sock.sendMessage(senderJid, {
-      text: "❌ Tidak ada grup yang tersedia (tidak ada grup terbuka atau bot belum bergabung ke grup manapun)."
+      text: "Tidak ada grup yang tersedia (tidak ada grup terbuka atau bot belum bergabung ke grup manapun)."
     }, { quoted: msg });
     return;
   }
 
   swgcPendingSessions.set(senderJid, { groups, payload: swgcPayload, ts: Date.now() });
 
-  let listText = `📋 *Pilih grup tujuan* untuk mengirim status grup:\n\n`;
+  let listText = `*Pilih grup tujuan* untuk mengirim status grup:\n\n`;
   listText += `Ketik nomor grup yang ingin dituju.\n`;
   listText += `Ketik *0* atau *batal* untuk membatalkan.\n\n`;
   groups.forEach((g, i) => {
     listText += `*${i+1}.* ${g.name}\n`;
-    listText += `     👥 ${g.participants} anggota | \`${g.jid}\`\n\n`;
+    listText += `     ${g.participants} anggota | \`${g.jid}\`\n\n`;
   });
   listText += `\nSesi ini akan kedaluwarsa dalam *5 menit*.`;
 
@@ -916,12 +1073,12 @@ async function sendSwgcToGroup(sock, targetGroupJid, payload, senderMsg, senderJ
         groupStatusMessageV2: { message: { ...finalPayload } }
       }, {});
 
-      await sock.sendMessage(senderJid, { text: `✅ Status media berhasil dikirim ke grup!` }, { quoted: senderMsg });
-      await react(sock, senderJid, senderMsg, "✅");
+      await sock.sendMessage(senderJid, { text: `Status media berhasil dikirim ke grup!` }, { quoted: senderMsg });
+      await react(sock, senderJid, senderMsg, "");
     } catch (err) {
       log.error("SWGC", `Gagal kirim status media: ${err.message}`);
-      await react(sock, senderJid, senderMsg, "❌");
-      await sock.sendMessage(senderJid, { text: `❌ Gagal mengirim status media: ${err.message}` }, { quoted: senderMsg });
+      await react(sock, senderJid, senderMsg, "");
+      await sock.sendMessage(senderJid, { text: `Gagal mengirim status media: ${err.message}` }, { quoted: senderMsg });
     }
     return;
   }
@@ -949,28 +1106,27 @@ async function sendSwgcToGroup(sock, targetGroupJid, payload, senderMsg, senderJ
       }
     }, {});
 
-    await sock.sendMessage(senderJid, { text: `✅ Status teks berhasil dikirim ke grup!` }, { quoted: senderMsg });
-    await react(sock, senderJid, senderMsg, "✅");
+    await sock.sendMessage(senderJid, { text: `Status teks berhasil dikirim ke grup!` }, { quoted: senderMsg });
+    await react(sock, senderJid, senderMsg, "");
   } catch (err) {
     log.error("SWGC", `Gagal kirim status teks: ${err.message}`);
-    await react(sock, senderJid, senderMsg, "❌");
-    await sock.sendMessage(senderJid, { text: `❌ Gagal mengirim status: ${err.message}` }, { quoted: senderMsg });
+    await react(sock, senderJid, senderMsg, "");
+    await sock.sendMessage(senderJid, { text: `Gagal mengirim status: ${err.message}` }, { quoted: senderMsg });
   }
 }
 
 async function handleSwgc(sock, msg, jid, text) {
   const isGroup = jid.endsWith("@g.us");
-  await react(sock, jid, msg, "⏳");
+  await react(sock, jid, msg, "");
 
   const quotedInfo = getQuotedMedia(msg);
   const customText = text.trim();
 
-  // ── Di dalam grup ────────────────────────────────────────────────────────────
   if (isGroup) {
     if (quotedInfo) {
       const downloaded = await downloadQuotedMedia(sock, msg);
       if (!downloaded) {
-        await react(sock, jid, msg, "❌");
+        await react(sock, jid, msg, "");
         await sock.sendMessage(jid, { text: "Gagal mendownload media. Pastikan kamu reply ke foto atau video." }, { quoted: msg });
         return;
       }
@@ -998,10 +1154,10 @@ async function handleSwgc(sock, msg, jid, text) {
           messageContextInfo: { messageSecret: "BrRzGQ6/B0ddqBuasejEf+rJKLQ2pauxHtAw1nIMPvw=" },
           groupStatusMessageV2: { message: { ...finalPayload } }
         }, {});
-        await react(sock, jid, msg, "✅");
+        await react(sock, jid, msg, "");
       } catch (err) {
         log.error("SWGC", `Gagal kirim status media: ${err.message}`);
-        await react(sock, jid, msg, "❌");
+        await react(sock, jid, msg, "");
         await sock.sendMessage(jid, { text: `Gagal mengirim status media: ${err.message}` }, { quoted: msg });
       }
       return;
@@ -1012,9 +1168,9 @@ async function handleSwgc(sock, msg, jid, text) {
       await sock.sendMessage(jid, {
         text:
           `Cara penggunaan .swgc:\n\n` +
-          `• Teks  : .swgc hai saya asep\n` +
-          `• Media : reply foto/video → .swgc\n` +
-          `• Media + teks : reply foto/video → .swgc teks caption kamu`
+          `Teks  : .swgc hai saya asep\n` +
+          `Media : reply foto/video -> .swgc\n` +
+          `Media + teks : reply foto/video -> .swgc teks caption kamu`
       }, { quoted: msg });
       return;
     }
@@ -1039,21 +1195,20 @@ async function handleSwgc(sock, msg, jid, text) {
           }
         }
       }, {});
-      await react(sock, jid, msg, "✅");
+      await react(sock, jid, msg, "");
     } catch (err) {
       log.error("SWGC", `Gagal kirim status teks: ${err.message}`);
-      await react(sock, jid, msg, "❌");
+      await react(sock, jid, msg, "");
       await sock.sendMessage(jid, { text: `Gagal mengirim status: ${err.message}` }, { quoted: msg });
     }
     return;
   }
 
-  // ── Di private chat ───────────────────────────────────────────────────────────
   let mediaData = null;
   if (quotedInfo) {
     const downloaded = await downloadQuotedMedia(sock, msg);
     if (!downloaded) {
-      await react(sock, jid, msg, "❌");
+      await react(sock, jid, msg, "");
       await sock.sendMessage(jid, { text: "Gagal mendownload media. Pastikan kamu reply ke foto atau video." }, { quoted: msg });
       return;
     }
@@ -1065,9 +1220,9 @@ async function handleSwgc(sock, msg, jid, text) {
     await sock.sendMessage(jid, {
       text:
         `Cara penggunaan .swgc di private chat:\n\n` +
-        `• Teks  : .swgc hai saya asep\n` +
-        `• Media : reply foto/video → .swgc\n` +
-        `• Media + teks : reply foto/video → .swgc teks caption kamu\n\n` +
+        `Teks  : .swgc hai saya asep\n` +
+        `Media : reply foto/video -> .swgc\n` +
+        `Media + teks : reply foto/video -> .swgc teks caption kamu\n\n` +
         `Setelah itu pilih grup tujuan dari daftar yang muncul.`
     }, { quoted: msg });
     return;
@@ -1082,7 +1237,7 @@ async function handleSwgcGroupSelection(sock, msg, jid) {
 
   if (Date.now() - pending.ts > 5 * 60 * 1000) {
     swgcPendingSessions.delete(jid);
-    await sock.sendMessage(jid, { text: "⏰ Sesi pemilihan grup telah kedaluwarsa. Silakan ulangi perintah .swgc." }, { quoted: msg });
+    await sock.sendMessage(jid, { text: "Sesi pemilihan grup telah kedaluwarsa. Silakan ulangi perintah .swgc." }, { quoted: msg });
     return true;
   }
 
@@ -1090,15 +1245,15 @@ async function handleSwgcGroupSelection(sock, msg, jid) {
 
   if (rawText === "0" || rawText.toLowerCase() === "batal") {
     swgcPendingSessions.delete(jid);
-    await react(sock, jid, msg, "❌");
-    await sock.sendMessage(jid, { text: "❌ Pemilihan grup dibatalkan." }, { quoted: msg });
+    await react(sock, jid, msg, "");
+    await sock.sendMessage(jid, { text: "Pemilihan grup dibatalkan." }, { quoted: msg });
     return true;
   }
 
   const num = parseInt(rawText, 10);
   if (isNaN(num) || num < 1 || num > pending.groups.length) {
     await sock.sendMessage(jid, {
-      text: `⚠️ Masukkan nomor yang valid (1–${pending.groups.length}), atau ketik *0* / *batal* untuk membatalkan.`
+      text: `Masukkan nomor yang valid (1-${pending.groups.length}), atau ketik *0* / *batal* untuk membatalkan.`
     }, { quoted: msg });
     return true;
   }
@@ -1106,14 +1261,12 @@ async function handleSwgcGroupSelection(sock, msg, jid) {
   const selectedGroup = pending.groups[num - 1];
   swgcPendingSessions.delete(jid);
 
-  log.info("SWGC", `→ ${selectedGroup.name}`);
-  await react(sock, jid, msg, "⏳");
-  await sock.sendMessage(jid, { text: `📤 Mengirim ke *${selectedGroup.name}*...` }, { quoted: msg });
+  log.info("SWGC", `-> ${selectedGroup.name}`);
+  await react(sock, jid, msg, "");
+  await sock.sendMessage(jid, { text: `Mengirim ke *${selectedGroup.name}*...` }, { quoted: msg });
   await sendSwgcToGroup(sock, selectedGroup.jid, pending.payload, msg, jid);
   return true;
 }
-
-// ─── Input-session handlers ────────────────────────────────────────────────────
 
 async function handleStartInputSession(sock, msg, jid, text) {
   const { isPremium, isAntiSteal } = parseFlags(text);
@@ -1149,7 +1302,7 @@ async function handleStatusCmd(sock, msg, jid) {
     return;
   }
 
-  const flags        = [session.isPremium && "Premium", session.isAntiSteal && "Anti-Steal"].filter(Boolean).join(", ");
+  const flags         = [session.isPremium && "Premium", session.isAntiSteal && "Anti-Steal"].filter(Boolean).join(", ");
   const totalStickers = session.stickers.length;
   const totalPacks    = Math.max(1, Math.ceil(totalStickers / MAX_PACK_STICKERS));
 
@@ -1175,7 +1328,7 @@ async function handleLinkInput(sock, msg, jid, msgText) {
   if (!urls.length) return;
 
   const sly = new StickerLy();
-  await react(sock, jid, msg, "⏳");
+  await react(sock, jid, msg, "");
 
   let addedTotal = 0;
   const failedUrls = [];
@@ -1199,13 +1352,13 @@ async function handleLinkInput(sock, msg, jid, msgText) {
   const totalStickers = session.stickers.length;
   const totalPacks    = Math.max(1, Math.ceil(totalStickers / MAX_PACK_STICKERS));
 
-  let replyText = `+${addedTotal} sticker ditambahkan. Total: ${totalStickers} dari ${session.links.length} link → ${totalPacks} pack.\n`;
+  let replyText = `+${addedTotal} sticker ditambahkan. Total: ${totalStickers} dari ${session.links.length} link -> ${totalPacks} pack.\n`;
   if (failedUrls.length) {
     replyText += `\nGagal (${failedUrls.length}):\n` + failedUrls.map(u => `- ${u}`).join("\n") + "\n";
   }
   replyText += `\n.done untuk kirim | .status untuk info | .cancel untuk batal`;
 
-  await react(sock, jid, msg, "✅");
+  await react(sock, jid, msg, "");
   await sock.sendMessage(jid, { text: replyText }, { quoted: msg });
 }
 
@@ -1220,16 +1373,16 @@ async function handleDoneCmd(sock, msg, jid) {
     return;
   }
 
-  await react(sock, jid, msg, "⏳");
+  await react(sock, jid, msg, "");
 
   const stickerChunks = chunkArray(session.stickers, MAX_PACK_STICKERS);
   const totalPacks    = stickerChunks.length;
 
-  log.info("DONE", `${session.stickers.length} stickers → ${totalPacks} pack`);
+  log.info("DONE", `${session.stickers.length} stickers -> ${totalPacks} pack`);
 
   if (totalPacks > 1) {
     await sock.sendMessage(jid, {
-      text: `Memproses ${session.stickers.length} sticker → ${totalPacks} pack...`
+      text: `Memproses ${session.stickers.length} sticker -> ${totalPacks} pack...`
     }, { quoted: msg });
   }
 
@@ -1264,7 +1417,7 @@ async function handleDoneCmd(sock, msg, jid) {
     await sock.sendMessage(jid, { text: summary }, { quoted: msg });
   }
 
-  await react(sock, jid, msg, successPacks > 0 ? "✅" : "❌");
+  await react(sock, jid, msg, successPacks > 0 ? "" : "");
 }
 
 async function handleSetPackName(sock, msg, jid, raw) {
@@ -1339,11 +1492,11 @@ async function handleStickerLy(sock, msg, text, jid) {
       });
       resultText +=
         `Usage:\n` +
-        `- .sly <url>                 → Normal pack\n` +
-        `- .sly <url> --prem          → Premium badge\n` +
-        `- .sly <url> --antisteal     → Avatar/AI metadata\n` +
-        `- .sly <url> --prem --antisteal → Both\n` +
-        `- .sly --input               → Gabungkan banyak link (maks ${MAX_PACK_STICKERS}/pack)`;
+        `- .sly <url>                 -> Normal pack\n` +
+        `- .sly <url> --prem          -> Premium badge\n` +
+        `- .sly <url> --antisteal     -> Avatar/AI metadata\n` +
+        `- .sly <url> --prem --antisteal -> Both\n` +
+        `- .sly --input               -> Gabungkan banyak link (maks ${MAX_PACK_STICKERS}/pack)`;
 
       return sock.sendMessage(jid, { text: resultText }, { quoted: msg });
     } catch { await react(sock, jid, msg, "x"); }
@@ -1363,7 +1516,6 @@ async function handleStickerLy(sock, msg, text, jid) {
   }
 }
 
-// ─── MAIN ─────────────────────────────────────────────────────────────────────
 (async function start() {
   function question(text) {
     return new Promise((resolve) => {
@@ -1467,7 +1619,7 @@ async function handleStickerLy(sock, msg, text, jid) {
 
       if (command === "swgc") {
         try { await handleSwgc(sock, msg, jid, text); }
-        catch (err) { log.error("SWGC", err.message); await react(sock, jid, msg, "❌"); }
+        catch (err) { log.error("SWGC", err.message); await react(sock, jid, msg, ""); }
         continue;
       }
 
@@ -1479,7 +1631,6 @@ async function handleStickerLy(sock, msg, text, jid) {
     }
   });
 
-  // ─── Periodic GC (silent, hanya log sekali per siklus) ───────────────────────
   if (global.gc) {
     setInterval(() => {
       bufferPool.clear();
